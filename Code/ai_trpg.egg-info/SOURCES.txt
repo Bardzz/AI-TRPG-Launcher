@@ -1,0 +1,7 @@
+pyproject.toml
+./ai_trpg/__init__.py
+ai_trpg.egg-info/PKG-INFO
+ai_trpg.egg-info/SOURCES.txt
+ai_trpg.egg-info/dependency_links.txt
+ai_trpg.egg-info/requires.txt
+ai_trpg.egg-info/top_level.txt

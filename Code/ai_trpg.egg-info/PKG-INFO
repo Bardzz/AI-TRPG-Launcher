@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: ai-trpg
+Version: 0.1.0
+Summary: AI TRPG Demo
+Requires-Python: >=3.10
+Requires-Dist: openai>=1.0.0
+Requires-Dist: requests
+Requires-Dist: pyttsx3
+Requires-Dist: pywin32; platform_system == "Windows"
