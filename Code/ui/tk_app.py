@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import threading
+import queue
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -10,14 +11,9 @@ from typing import Any, Optional
 import tkinter as tk
 from tkinter import scrolledtext, filedialog
 
-import markdown
-from tkhtmlview import HTMLLabel
-
-# 依赖你的新架构
 from paths import ProjectPaths
 from core.general_tools import markdown_to_text
 from core.json_tools import parse_json_object
-
 
 
 @dataclass
@@ -28,9 +24,9 @@ class UIFlags:
 
 class StreamDisplayApp:
     """
-    Tk UI（Web-like 三栏布局）
-    - 左：输入 + 主回复
-    - 右上：历史（倒序）
+    三栏布局（强制显示最新版本）
+    - 左：输入 + 主回复（流式，永远滚到最新）
+    - 右上：历史（倒序 + 搜索过滤）
     - 右下：状态（diff 高亮）
     """
 
@@ -50,18 +46,20 @@ class StreamDisplayApp:
         self.last_final_assistant_md = ""
         self.status: dict[str, Any] = {}
 
-        # history filter
         self.history_filter_var = tk.StringVar(value="")
-
-        # UI status bar
         self.status_var = tk.StringVar(value="准备就绪")
+
+        # stream queue
+        self._stream_q: queue.Queue[str] = queue.Queue()
+        self._drain_after_id: Optional[str] = None
+        self._drain_interval_ms = 33
+        self._drain_batch_chars = 6000
 
         self._build_window()
         self._build_layout()
         self._bind_shortcuts()
 
         self._init_window_content()
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
 
     # ---------------------------
@@ -72,7 +70,6 @@ class StreamDisplayApp:
         self.root.title("AI TRPG Manager")
         self.root.geometry("1100x700")
 
-        # Grid: 2 columns main, row 0 content, row 1 controls, row 2 statusbar
         self.root.grid_columnconfigure(0, weight=2, uniform="col")
         self.root.grid_columnconfigure(1, weight=1, uniform="col")
         self.root.grid_rowconfigure(0, weight=1)
@@ -80,14 +77,12 @@ class StreamDisplayApp:
         self.root.grid_rowconfigure(2, weight=0)
 
     def _build_layout(self):
-        # Left (chat)
         self.left = tk.Frame(self.root)
         self.left.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        self.left.grid_rowconfigure(0, weight=0)  # input
-        self.left.grid_rowconfigure(1, weight=1)  # reply
+        self.left.grid_rowconfigure(0, weight=0)
+        self.left.grid_rowconfigure(1, weight=1)
         self.left.grid_columnconfigure(0, weight=1)
 
-        # Right (history + status)
         self.right = tk.Frame(self.root)
         self.right.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
         self.right.grid_rowconfigure(0, weight=2)
@@ -110,10 +105,8 @@ class StreamDisplayApp:
 
         self.input_text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, height=7)
         self.input_text.grid(row=1, column=0, sticky="nsew")
-        # Enter to send, Shift+Enter newline
         self.input_text.bind("<Return>", self._on_enter)
 
-        # helper line
         helper = "Enter 发送 | Shift+Enter 换行 | Ctrl+L 清空输入"
         tk.Label(frame, text=helper, fg="#666").grid(row=2, column=0, sticky="w", pady=(4, 0))
 
@@ -124,8 +117,14 @@ class StreamDisplayApp:
         frame.grid_columnconfigure(0, weight=1)
 
         tk.Label(frame, text="主持人：").grid(row=0, column=0, sticky="w")
-        self.reply_label = HTMLLabel(frame, html="", wrap=tk.WORD)
-        self.reply_label.grid(row=1, column=0, sticky="nsew")
+
+        self.reply_text = scrolledtext.ScrolledText(frame, wrap=tk.WORD)
+        self.reply_text.grid(row=1, column=0, sticky="nsew")
+
+        # 只读：不切 state（避免某些 Tk 实现奇怪副作用）
+        self.reply_text.bind("<Key>", lambda e: "break")
+        self.reply_text.bind("<<Paste>>", lambda e: "break")
+        self.reply_text.bind("<<Cut>>", lambda e: "break")
 
     def _build_history_panel(self):
         frame = tk.Frame(self.right)
@@ -138,7 +137,6 @@ class StreamDisplayApp:
         header.grid_columnconfigure(1, weight=1)
 
         tk.Label(header, text="历史记录：").grid(row=0, column=0, sticky="w")
-
         tk.Label(header, text="搜索").grid(row=0, column=1, sticky="e", padx=(0, 6))
         search = tk.Entry(header, textvariable=self.history_filter_var, width=18)
         search.grid(row=0, column=2, sticky="e")
@@ -147,8 +145,11 @@ class StreamDisplayApp:
         hint = tk.Label(frame, text="（倒序显示，输入关键字过滤）", fg="#666")
         hint.grid(row=1, column=0, sticky="w", pady=(4, 4))
 
-        self.history_label = HTMLLabel(frame, html="", wrap=tk.WORD)
-        self.history_label.grid(row=2, column=0, sticky="nsew")
+        self.history_text = scrolledtext.ScrolledText(frame, wrap=tk.WORD)
+        self.history_text.grid(row=2, column=0, sticky="nsew")
+        self.history_text.bind("<Key>", lambda e: "break")
+        self.history_text.bind("<<Paste>>", lambda e: "break")
+        self.history_text.bind("<<Cut>>", lambda e: "break")
 
     def _build_status_panel(self):
         frame = tk.Frame(self.right, bd=2, relief=tk.GROOVE)
@@ -159,7 +160,6 @@ class StreamDisplayApp:
         self.player_status_table = tk.Frame(frame)
         self.player_status_table.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        # 初始化默认状态
         self.status = {
             "生理状态": "良好",
             "恐惧程度": "低",
@@ -180,7 +180,6 @@ class StreamDisplayApp:
         right = tk.Frame(bar)
         right.grid(row=0, column=1, sticky="e")
 
-        # left controls
         self.load_btn = tk.Button(left, text="读档", command=self.load_from_json, bg="#e6ffe6")
         self.load_btn.pack(side=tk.LEFT, padx=4)
 
@@ -190,14 +189,12 @@ class StreamDisplayApp:
         self.export_btn = tk.Button(left, text="导出回放", command=self.export_replay_txt)
         self.export_btn.pack(side=tk.LEFT, padx=4)
 
-        # toggles
         self.read_var = tk.BooleanVar(value=self.flags.read_aloud)
         self.auto_save_var = tk.BooleanVar(value=self.flags.auto_save)
 
         tk.Checkbutton(left, text="文本朗读", variable=self.read_var, command=self._on_toggle_read).pack(side=tk.LEFT, padx=10)
         tk.Checkbutton(left, text="自动存档", variable=self.auto_save_var, command=self._on_toggle_autosave).pack(side=tk.LEFT)
 
-        # right controls
         self.stop_btn = tk.Button(right, text="停止", command=self.stop_stream, state=tk.DISABLED, bg="#ffe6e6")
         self.stop_btn.pack(side=tk.RIGHT, padx=4)
 
@@ -220,24 +217,20 @@ class StreamDisplayApp:
 
     def _init_window_content(self):
         self.safe_update_status("初始化中...")
-
-        # 初始输入提示
         self.input_text.insert(tk.END, "# 欢迎使用\n玩家在这里输入...")
 
-        # 开场白：调用 agent.show_beginning()
         try:
             beginning = self._agent_show_beginning()
         except Exception as e:
             beginning = ""
-            self.safe_set_error(f"初始化失败：{e}")
+            self._reply_clear_set(f"[错误] 初始化失败：{e}\n")
 
-        initial_bottom = "# 这里是每轮主持人的回复\n" + (beginning or "")
-        self.reply_label.set_html(self._wrap_html(markdown.markdown(initial_bottom)))
+        initial_text = "# 这里是每轮主持人的回复\n" + (beginning or "")
+        self._reply_clear_set(initial_text)
 
         self.safe_update_history()
         self.safe_update_status("准备就绪")
 
-        # 可选朗读
         if self.read_var.get() and beginning:
             self._voice_speak(markdown_to_text(beginning))
 
@@ -246,7 +239,6 @@ class StreamDisplayApp:
     # ---------------------------
 
     def _agent_show_beginning(self) -> str:
-        # 新版：show_beginning；旧版：show_background
         if hasattr(self.agent, "show_beginning"):
             return self.agent.show_beginning()
         if hasattr(self.agent, "show_background"):
@@ -254,7 +246,6 @@ class StreamDisplayApp:
         return ""
 
     def _agent_stream_chat(self, user_text: str):
-        # 新版：talk(user_text, stream=True)；旧版：talk_2_kp(prompt=..., stream_mode=True)
         if hasattr(self.agent, "talk"):
             return self.agent.talk(user_text, stream=True)
         if hasattr(self.agent, "talk_2_kp"):
@@ -262,17 +253,14 @@ class StreamDisplayApp:
         raise AttributeError("Agent does not support streaming chat")
 
     def _agent_commit_assistant(self, full_md: str):
-        # 新版：commit_assistant_reply；旧版：UI 自己 append kp_history（你之前做法）
         if hasattr(self.agent, "commit_assistant_reply"):
             self.agent.commit_assistant_reply(full_md)
         else:
-            # fallback: try kp_history/history
             hist = self._agent_get_history()
             if hist is not None:
                 hist.append({"role": "assistant", "content": markdown_to_text(full_md)})
 
     def _agent_update_status(self) -> dict:
-        # 新版：update_status_json；旧版：json_reply(last_status) 返回 json str
         if hasattr(self.agent, "update_status_json"):
             return self.agent.update_status_json()
         if hasattr(self.agent, "json_reply"):
@@ -281,7 +269,6 @@ class StreamDisplayApp:
         return self.status
 
     def _agent_get_history(self) -> Optional[list[dict]]:
-        # 新版：history；旧版：kp_history
         if hasattr(self.agent, "history"):
             return self.agent.history
         if hasattr(self.agent, "kp_history"):
@@ -293,7 +280,6 @@ class StreamDisplayApp:
     # ---------------------------
 
     def _on_enter(self, event):
-        # Shift+Enter => newline
         if event.state & 0x1:
             return
         self.process_input()
@@ -311,10 +297,15 @@ class StreamDisplayApp:
         self.full_response_md = ""
         self.cancel_event.clear()
 
+        self._drain_stream_queue(clear_only=True)
+        self._reply_clear_set("")  # 清空一次
+
         self.streaming = True
         self.send_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.safe_update_status("正在获取回复...")
+
+        self._start_drain_loop()
 
         t = threading.Thread(target=self._fetch_stream_worker, args=(user_text,), daemon=True)
         t.start()
@@ -332,7 +323,6 @@ class StreamDisplayApp:
             self.safe_update_status("没有可重试的上一轮输入")
             return
 
-        # 可选：若最后一条是 assistant，则弹出，避免重复堆叠
         hist = self._agent_get_history()
         if hist and hist[-1].get("role") == "assistant":
             hist.pop()
@@ -350,50 +340,108 @@ class StreamDisplayApp:
                 if self.cancel_event.is_set():
                     break
 
-                # OpenAI/DeepSeek stream chunk parsing
-                content = ""
-                try:
-                    if hasattr(chunk, "choices") and chunk.choices and chunk.choices[0].delta:
-                        content = chunk.choices[0].delta.content or ""
-                except Exception:
-                    content = ""
-
+                content = self._extract_stream_text(chunk)
                 if content:
                     self.full_response_md += content
-                    self.root.after(0, self._render_reply_stream)
+                    self._stream_q.put(content)
 
             self.root.after(0, self._finalize_stream)
 
         except Exception as e:
-            self.root.after(0, lambda: self.safe_set_error(f"发生错误: {e}"))
+            self.root.after(0, lambda: self._reply_append_follow_latest(f"\n\n[错误]\n{e}\n"))
         finally:
             self.streaming = False
             self.root.after(0, self._reset_buttons)
 
-    def _render_reply_stream(self):
-        # 渲染当前累计的 markdown
-        html = markdown.markdown(self.full_response_md)
-        self.reply_label.set_html(self._wrap_html(html))
-        self.status_var.set(f"接收中... {len(self.full_response_md)} 字符")
+    @staticmethod
+    def _extract_stream_text(chunk) -> str:
+        try:
+            if hasattr(chunk, "choices") and chunk.choices:
+                c0 = chunk.choices[0]
+                if hasattr(c0, "delta") and c0.delta and hasattr(c0.delta, "content"):
+                    return c0.delta.content or ""
+                if hasattr(c0, "message") and c0.message and hasattr(c0.message, "content"):
+                    return c0.message.content or ""
+        except Exception:
+            pass
+
+        try:
+            if isinstance(chunk, dict):
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    if "content" in delta:
+                        return delta["content"] or ""
+        except Exception:
+            pass
+
+        return ""
+
+    # ---------------------------
+    # Drain loop (main thread)
+    # ---------------------------
+
+    def _start_drain_loop(self):
+        if self._drain_after_id is None:
+            self._drain_after_id = self.root.after(self._drain_interval_ms, self._drain_stream_queue)
+
+    def _drain_stream_queue(self, clear_only: bool = False):
+        if clear_only:
+            while True:
+                try:
+                    self._stream_q.get_nowait()
+                except queue.Empty:
+                    break
+            return
+
+        self._drain_after_id = None
+        if self.cancel_event.is_set():
+            return
+
+        pieces: list[str] = []
+        total = 0
+        while True:
+            try:
+                s = self._stream_q.get_nowait()
+            except queue.Empty:
+                break
+            pieces.append(s)
+            total += len(s)
+            if total >= self._drain_batch_chars:
+                break
+
+        if pieces:
+            self._reply_append_follow_latest("".join(pieces))
+            self.status_var.set(f"接收中... {len(self.full_response_md)} 字符")
+
+        if self.streaming and not self.cancel_event.is_set():
+            self._drain_after_id = self.root.after(self._drain_interval_ms, self._drain_stream_queue)
+
+    # ---------------------------
+    # Finalize / Buttons
+    # ---------------------------
 
     def _finalize_stream(self):
         if self.cancel_event.is_set():
             self.safe_update_status("已停止（本轮未提交）")
             return
 
+        while True:
+            try:
+                s = self._stream_q.get_nowait()
+            except queue.Empty:
+                break
+            self._reply_append_follow_latest(s)
+
         self.last_final_assistant_md = self.full_response_md
 
-        # 1) commit assistant
         self._agent_commit_assistant(self.full_response_md)
 
-        # 2) read aloud
         if self.read_var.get() and self.full_response_md:
             self._voice_speak(markdown_to_text(self.full_response_md))
 
-        # 3) update history panel
         self.safe_update_history()
 
-        # 4) update status (diff highlight)
         old_status = dict(self.status)
         try:
             new_status = self._agent_update_status()
@@ -406,7 +454,6 @@ class StreamDisplayApp:
         self.status = new_status
         self.update_player_status(new_status, old_status=old_status)
 
-        # 5) auto save
         if self.auto_save_var.get():
             self.save_to_json(auto=True)
 
@@ -417,6 +464,24 @@ class StreamDisplayApp:
         self.stop_btn.config(state=tk.DISABLED)
 
     # ---------------------------
+    # Reply helpers (FORCE LATEST)
+    # ---------------------------
+
+    def _reply_clear_set(self, text: str):
+        self.reply_text.delete("1.0", tk.END)
+        if text:
+            self.reply_text.insert(tk.END, text)
+        # ✅ 强制显示最新
+        self.reply_text.see(tk.END)
+
+    def _reply_append_follow_latest(self, text: str):
+        if not text:
+            return
+        self.reply_text.insert(tk.END, text)
+        # ✅ 强制显示最新：覆盖任何“被刷到顶部”的行为
+        self.reply_text.see(tk.END)
+
+    # ---------------------------
     # History render
     # ---------------------------
 
@@ -424,24 +489,19 @@ class StreamDisplayApp:
         hist = self._agent_get_history() or []
         keyword = self.history_filter_var.get().strip()
 
-        # 过滤：跳过最前面的系统/规则等（你原来从 3 开始）
-        # 新版 history: [system(rule), system(bg), user(beginning), assistant(...), ...]
-        # 旧版 kp_history: 结构可能不同
         start_idx = 0
         if len(hist) >= 3:
-            start_idx = 2  # 保留规则/背景不显示，按你习惯可调整
+            start_idx = 2
 
         filtered = hist[start_idx:][::-1]
 
-        parts = []
+        out_lines: list[str] = []
         for msg in filtered:
             role = msg.get("role", "unknown")
             role_cn = {"system": "系统", "user": "玩家", "assistant": "主持人", "tool": "工具"}.get(role, role)
 
             content = msg.get("content", "")
-            content_txt = content
             try:
-                # 旧版工具函数可能叫 markdown_to_text_simple；这里用新工具
                 content_txt = markdown_to_text(str(content))
             except Exception:
                 content_txt = str(content)
@@ -449,12 +509,13 @@ class StreamDisplayApp:
             if keyword and (keyword not in content_txt) and (keyword not in role_cn):
                 continue
 
-            parts.append("─" * 40)
-            parts.append(f"{role_cn}：")
-            parts.append(content_txt)
+            out_lines.append("─" * 40)
+            out_lines.append(f"{role_cn}：")
+            out_lines.append(content_txt)
+            out_lines.append("")
 
-        html = "<br>".join([markdown.markdown(p) if p.startswith("#") else p.replace("\n", "<br>") for p in parts])
-        self.history_label.set_html(self._wrap_html(html))
+        self.history_text.delete("1.0", tk.END)
+        self.history_text.insert(tk.END, "\n".join(out_lines))
 
     # ---------------------------
     # Status render
@@ -485,7 +546,7 @@ class StreamDisplayApp:
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     # ---------------------------
-    # Persistence: Save / Load / Export
+    # Persistence
     # ---------------------------
 
     def save_to_json(self, *, auto: bool):
@@ -499,11 +560,7 @@ class StreamDisplayApp:
         tag = "AUTO" if auto else "MANUAL"
         file_path = self.paths.save_dir / f"TRPG_SAVE_{tag}_{ts}.json"
 
-        payload = {
-            "history": hist,
-            "status": self.status,
-            "meta": {"timestamp": ts}
-        }
+        payload = {"history": hist, "status": self.status, "meta": {"timestamp": ts}}
 
         try:
             file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -524,18 +581,15 @@ class StreamDisplayApp:
 
         try:
             data = json.loads(Path(fp).read_text(encoding="utf-8"))
-            # 新格式：{history,status,meta}
             if isinstance(data, dict) and "history" in data:
                 hist = data["history"]
                 status = data.get("status", self.status)
-            # 旧格式：直接是 list[dict]
             elif isinstance(data, list):
                 hist = data
                 status = self.status
             else:
                 raise ValueError("存档格式不支持")
 
-            # 写回 agent
             if hasattr(self.agent, "history"):
                 self.agent.history = hist
             elif hasattr(self.agent, "kp_history"):
@@ -550,7 +604,8 @@ class StreamDisplayApp:
             self.safe_update_status(f"读档成功：{Path(fp).name}")
 
         except Exception as e:
-            self.safe_set_error(f"读档失败：{e}")
+            self._reply_append_follow_latest(f"\n\n[读档失败]\n{e}\n")
+            self.safe_update_status("读档失败（详情见左侧输出）")
 
     def export_replay_txt(self):
         hist = self._agent_get_history()
@@ -589,23 +644,8 @@ class StreamDisplayApp:
     # UI helpers
     # ---------------------------
 
-    def _wrap_html(self, inner_html: str) -> str:
-        return f"""
-        <div style='
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            line-height: 1.6;
-            padding: 10px;
-        '>{inner_html}</div>
-        """
-
     def safe_update_status(self, message: str):
         self.root.after(0, lambda: self.status_var.set(message))
-
-    def safe_set_error(self, error_msg: str):
-        self.root.after(0, lambda: self.reply_label.set_html(
-            self._wrap_html(f"<div style='color:red;'><b>错误：</b>{error_msg}</div>")
-        ))
 
     def _on_toggle_read(self):
         self.flags.read_aloud = bool(self.read_var.get())
@@ -623,7 +663,6 @@ class StreamDisplayApp:
 
     def on_window_close(self):
         try:
-            # 自动导出回放（不弹窗）
             self.export_replay_txt()
         except Exception:
             pass
